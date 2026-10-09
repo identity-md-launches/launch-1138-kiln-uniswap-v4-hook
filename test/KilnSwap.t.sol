@@ -11,10 +11,13 @@ import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.
 import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 
 import {Kiln} from "../src/Kiln.sol";
 import {KilnBase} from "./KilnBase.t.sol";
+import {MockPepeo} from "./mocks/MockPepeo.sol";
 
 /// @notice Swap-side behaviour of the Kiln against the real v4 PoolManager: the four swap shapes for every tier,
 ///         claims, collect(), the LP fee and the hook's guards.
@@ -209,6 +212,221 @@ contract KilnSwapTest is KilnBase {
         assertEq(kiln.claims(), 0);
         assertEq(kiln.reserve(), cut + traderClaims);
         assertEq(zto.balanceOf(address(kiln)), cut + traderClaims);
+    }
+
+    // ------------------------------------------------------------------ partial fills
+
+    /// @dev The revert v4 surfaces when the hook's afterSwap reverts with PartialFill(asked, realised).
+    function _partialFillRevert(uint256 asked, uint256 realised) internal view returns (bytes memory) {
+        bytes memory reason = abi.encodeWithSelector(Kiln.PartialFill.selector, asked, realised);
+        bytes memory details = abi.encodeWithSelector(Hooks.HookCallFailed.selector);
+        address hook = address(kiln);
+        bytes4 selector = IHooks.afterSwap.selector;
+        return abi.encodeWithSelector(CustomRevert.WrappedError.selector, hook, selector, reason, details);
+    }
+
+    /// @dev Checks the one Passed event in the recorded logs and returns its ztoTaken.
+    function _assertPassed(address trader, uint256 pepes, uint24 cut) internal returns (uint256 taken) {
+        (address pTrader, uint256 pPepes, uint24 pCut, uint256 pTaken) = findPassed(vm.getRecordedLogs());
+        assertEq(pTrader, trader, "Passed.trader");
+        assertEq(pPepes, pepes, "Passed.pepes");
+        assertEq(pCut, cut, "Passed.kilnCut");
+        return pTaken;
+    }
+
+    /// @dev The current sqrtPriceX96 scaled by `bps / 10_000`, for price limits inside the range.
+    function _limitAt(uint256 bps) internal view returns (uint160) {
+        (uint160 price,,,) = manager.getSlot0(poolId);
+        return uint160(uint256(price) * bps / 10_000);
+    }
+
+    /// @dev Swaps with an explicit price limit so the pool stops early.
+    function _swapWithLimit(address trader, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        internal
+        returns (BalanceDelta delta)
+    {
+        return _swapFull(trader, trader, zeroForOne, amountSpecified, limit);
+    }
+
+    /// @dev Swaps with msg.sender `trader` but tx.origin `origin`, as a from-less eth_call looks to the hook.
+    function _swapWithOrigin(address trader, address origin, bool zeroForOne, int256 amountSpecified)
+        internal
+        returns (BalanceDelta delta)
+    {
+        uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        return _swapFull(trader, origin, zeroForOne, amountSpecified, limit);
+    }
+
+    function _swapFull(address trader, address origin, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        internal
+        returns (BalanceDelta delta)
+    {
+        uint256 value;
+        if (zeroForOne && amountSpecified < 0) value = uint256(-amountSpecified);
+        if (zeroForOne && amountSpecified > 0) {
+            // Exact ZTO output: send plenty of ETH, the router refunds the unused part.
+            value = 5000 ether;
+            vm.deal(trader, trader.balance + value);
+        }
+        vm.prank(trader, origin);
+        delta = swapRouter.swap{value: value}(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    /// Case 1, ZTO in exact input, asking for more ETH than the range holds: the cut was taken on the full input
+    /// in beforeSwap, so the pool stopping early must revert instead of charging the cut on ZTO never swapped.
+    function test_partialFill_ztoIn_exactIn_reverts() public {
+        address trader = makeTrader("t0", 0);
+        uint256 input = 100_000_000e18;
+        uint256 cut = input * 13_000 / PIPS;
+        // What the pool would consume before running out of ETH: compute it with a no-cut wallet first.
+        uint256 snap = vm.snapshotState();
+        BalanceDelta probe = swapAs(whale, false, -int256(input));
+        uint256 consumed = abs(probe.amount1());
+        assertLt(consumed, input - cut, "fixture: the swap really is a partial fill");
+        vm.revertToState(snap);
+
+        uint256 claimsBefore = kiln.claims();
+        vm.expectRevert(_partialFillRevert(input - cut, consumed));
+        swapAs(trader, false, -int256(input));
+        assertEq(kiln.claims(), claimsBefore, "nothing taken");
+    }
+
+    /// Case 4, ETH in exact ZTO output larger than the ZTO the range holds: reverts rather than leaving the trader
+    /// paying ETH and ZTO for nothing.
+    function test_partialFill_ethIn_exactOut_reverts() public {
+        address trader = makeTrader("t0", 0);
+        uint256 output = zto.balanceOf(address(manager)) * 200;
+        uint256 cut = output * 13_000 / PIPS;
+        uint256 snap = vm.snapshotState();
+        BalanceDelta probe = _swapWithLimit(whale, true, int256(output), TickMath.MIN_SQRT_PRICE + 1);
+        uint256 delivered = abs(probe.amount1());
+        assertLt(delivered, output, "fixture: the swap really is a partial fill");
+        vm.revertToState(snap);
+
+        vm.expectRevert(_partialFillRevert(output + cut, delivered));
+        _swapWithLimit(trader, true, int256(output), TickMath.MIN_SQRT_PRICE + 1);
+        assertEq(kiln.claims(), 0, "nothing taken");
+    }
+
+    /// A price limit inside the range stops the pool early too, for every tier that pays a cut.
+    function test_partialFill_priceLimit_revertsForEveryPayingTier() public {
+        uint160 limit = _limitAt(10_002); // ZTO in pushes the price up; stop almost at once
+        for (uint256 t; t < 5; ++t) {
+            address trader = makeTrader(string.concat("tier", vm.toString(t)), tierPieces[t]);
+            vm.prank(trader, trader);
+            vm.expectRevert(); // PartialFill wrapped by the PoolManager
+            swapRouter.swap(
+                key,
+                IPoolManager.SwapParams({
+                    zeroForOne: false, amountSpecified: -int256(ZTO_AMOUNT), sqrtPriceLimitX96: limit
+                }),
+                PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+                ""
+            );
+        }
+        assertEq(kiln.claims(), 0);
+    }
+
+    /// A wallet that pays no cut has nothing to reconcile: its ZTO-specified swaps may fill partially like any
+    /// other v4 swap.
+    function test_partialFill_tier21_isAllowed() public {
+        BalanceDelta delta = _swapWithLimit(whale, false, -int256(ZTO_AMOUNT), _limitAt(10_002));
+        assertLt(abs(delta.amount1()), ZTO_AMOUNT, "price-limited partial fill went through");
+        assertEq(kiln.claims(), 0);
+        uint256 input = 100_000_000e18;
+        delta = swapAs(whale, false, -int256(input));
+        assertLt(abs(delta.amount1()), input, "liquidity-exhausted partial fill went through");
+        assertGt(delta.amount0(), 0, "ETH received");
+        assertEq(kiln.claims(), 0);
+    }
+
+    /// Cases 2 and 3 measure the cut in afterSwap on the ZTO the pool actually moved, so a partial fill is simply
+    /// charged on the realised amount. Case 3 here: ETH in exact input driven to a price limit inside the range.
+    function test_partialFill_ethIn_exactIn_chargesRealisedAmount() public {
+        address trader = makeTrader("t0", 0);
+        BalanceDelta delta = _swapWithLimit(trader, true, -4 ether, _limitAt(9_990));
+        uint256 taken = kiln.claims();
+        uint256 ethIn = abs(delta.amount0());
+        assertGt(ethIn, 0);
+        assertLt(ethIn, 4 ether, "partial: not all ETH consumed");
+        uint256 poolOut = abs(delta.amount1()) + taken;
+        assertApproxEqAbs(taken, poolOut * 13_000 / PIPS, 1, "cut is 1.30% of the ZTO delivered");
+    }
+
+    /// Case 2: ZTO in, exact ETH output larger than the ETH the range holds.
+    function test_partialFill_ztoIn_exactOut_chargesRealisedAmount() public {
+        address trader = makeTrader("t0", 0);
+        uint256 ethInPool = address(manager).balance;
+        BalanceDelta delta = swapAs(trader, false, int256(ethInPool * 2));
+        uint256 taken = kiln.claims();
+        assertLt(abs(delta.amount0()), ethInPool * 2, "partial: less ETH than asked");
+        uint256 poolIn = abs(delta.amount1()) - taken;
+        assertGt(poolIn, 0);
+        assertApproxEqAbs(taken, poolIn * 13_000 / PIPS, 1, "cut is 1.30% of the ZTO consumed");
+    }
+
+    /// An empty pool: ZTO exact-in reverts (the pool consumes nothing, the cut would be pure loss); ETH exact-in
+    /// delivers nothing and takes nothing.
+    function test_partialFill_emptyPool() public {
+        vm.startPrank(lp);
+        lpRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: RANGE_LOWER, tickUpper: OPEN_TICK, liquidityDelta: -RANGE_LIQUIDITY, salt: bytes32(0)
+            }),
+            ""
+        );
+        vm.stopPrank();
+        assertEq(manager.getLiquidity(poolId), 0);
+        address trader = makeTrader("t0", 0);
+        vm.expectRevert(_partialFillRevert(ZTO_AMOUNT - ZTO_AMOUNT * 13_000 / PIPS, 0));
+        swapAs(trader, false, -int256(ZTO_AMOUNT));
+        BalanceDelta delta = swapAs(trader, true, -ETH_AMOUNT);
+        assertEq(delta.amount1(), 0);
+        assertEq(kiln.claims(), 0);
+    }
+
+    // ------------------------------------------------------------------ pass reads that must not revert
+
+    /// A from-less eth_call runs with tx.origin == 0, where Pepeolithic's OpenZeppelin balanceOf reverts. The
+    /// Kiln treats that as no pieces so quoters and simulations still work.
+    function test_zeroTxOrigin_isTierZero() public {
+        vm.expectRevert(abi.encodeWithSelector(MockPepeo.ERC721InvalidOwner.selector, address(0)));
+        pepeo.balanceOf(address(0));
+        (uint256 index, uint256 pepes, uint24 cut) = kiln.tierOf(address(0));
+        assertEq(index, 0);
+        assertEq(pepes, 0);
+        assertEq(cut, 13_000);
+    }
+
+    function test_zeroTxOrigin_swapSimulationSucceeds() public {
+        address trader = makeTrader("t0", 0);
+        vm.recordLogs();
+        BalanceDelta delta = _swapWithOrigin(trader, address(0), true, -ETH_AMOUNT);
+        uint256 taken = _assertPassed(address(0), 0, 13_000);
+        assertEq(taken, kiln.claims());
+        assertApproxEqAbs(taken, (abs(delta.amount1()) + taken) * 13_000 / PIPS, 1);
+    }
+
+    /// If the PEPEO read fails for any reason the swap still goes through at tier 0 rather than bricking the pool.
+    function test_pepeoReadFailure_fallsBackToTierZero() public {
+        pepeo.setBalanceOfReverts(true);
+        vm.recordLogs();
+        BalanceDelta delta = swapAs(whale, true, -ETH_AMOUNT);
+        uint256 taken = _assertPassed(whale, 0, 13_000); // 21 pieces unreadable: treated as none
+        assertGt(taken, 0);
+        assertApproxEqAbs(taken, (abs(delta.amount1()) + taken) * 13_000 / PIPS, 1);
+        pepeo.setBalanceOfReverts(false);
+        uint256 before = kiln.claims();
+        swapAs(whale, true, -ETH_AMOUNT);
+        assertEq(kiln.claims(), before, "pass readable again: no cut");
     }
 
     // ------------------------------------------------------------------ guards

@@ -5,6 +5,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {Kiln} from "./Kiln.sol";
 
 /// @title Launcher
@@ -13,6 +14,7 @@ import {Kiln} from "./Kiln.sol";
 /// @dev The constructor stores three addresses and makes no external call, so it deploys on an empty chain.
 contract Launcher {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     /// @notice The ZTO token, currency1 of the pool.
     address public immutable ZTO;
@@ -25,6 +27,9 @@ contract Launcher {
     Kiln public kiln;
 
     event Opened(address indexed kiln, PoolId poolId);
+    /// @notice Somebody initialized the pool key for the predicted Kiln address before `open()` ran. The pool was
+    ///         adopted at `liveSqrtPriceX96` and `requestedSqrtPriceX96` was ignored.
+    event Preinitialized(PoolId indexed poolId, uint160 liveSqrtPriceX96, uint160 requestedSqrtPriceX96);
 
     error ZeroAddress();
     error AlreadyOpened();
@@ -53,6 +58,10 @@ contract Launcher {
     /// @notice Deploys the Kiln at `salt`, checks its address carries exactly the swap hook bits, and initializes
     ///         the ETH/ZTO pool (lpFee 2000, tickSpacing 60, Kiln as hook) at `sqrtPriceX96`. Permissionless,
     ///         succeeds once. Adds no liquidity: the deployer adds a ZTO-only range position afterwards.
+    /// @dev The pool key is predictable from the salt and anyone may initialize it on the PoolManager before the
+    ///      Kiln exists (the Kiln has no initialize hook bits, so no hook call stops them). Reverting there would
+    ///      let a griefer block every salt the deployer mines, so an already-initialized pool is adopted at its
+    ///      live price instead and `Preinitialized` reports it. Check slot0 before adding liquidity.
     function open(bytes32 salt, uint160 sqrtPriceX96) external returns (address kilnAddr, PoolId poolId) {
         if (address(kiln) != address(0)) revert AlreadyOpened();
         Kiln deployed = new Kiln{salt: salt}(ZTO, PEPEO, POOL_MANAGER);
@@ -61,7 +70,12 @@ contract Launcher {
         kiln = deployed;
         PoolKey memory key = deployed.poolKey();
         poolId = key.toId();
-        IPoolManager(POOL_MANAGER).initialize(key, sqrtPriceX96);
+        (uint160 livePrice,,,) = IPoolManager(POOL_MANAGER).getSlot0(poolId);
+        if (livePrice == 0) {
+            IPoolManager(POOL_MANAGER).initialize(key, sqrtPriceX96);
+        } else {
+            emit Preinitialized(poolId, livePrice, sqrtPriceX96);
+        }
         emit Opened(kilnAddr, poolId);
     }
 }

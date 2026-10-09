@@ -229,6 +229,99 @@ contract KilnPiecesTest is KilnBase {
         assertEq(kiln.reserve(), reserve + claims + ask);
     }
 
+    // ------------------------------------------------------------------ quotes and price bounds
+
+    /// bid()/ask() read the reserve only; sell()/buy() collect first. quoteBid()/quoteAsk() are what they execute
+    /// at, and the bounded overloads let a caller refuse a price that moved between quote and execution.
+    function test_quote_includesPendingClaims() public {
+        seed(5000e18);
+        uint256 id = mintPiece(seller);
+        vm.prank(seller);
+        kiln.sell(id);
+        assertEq(kiln.quoteBid(), kiln.bid(), "nothing pending: quote equals bid");
+        assertEq(kiln.quoteAsk(), kiln.ask());
+
+        address trader = makeTrader("t0", 0);
+        swapAs(trader, true, -1 ether);
+        uint256 claims = kiln.claims();
+        assertGt(claims, 0);
+        assertEq(kiln.ask(), 98e18 * 11_500 / 10_000, "ask() still reads the reserve only");
+        uint256 expectedBid = (4900e18 + claims) / 50;
+        assertEq(kiln.quoteBid(), expectedBid);
+        assertEq(kiln.quoteAsk(), expectedBid * 11_500 / 10_000);
+        assertGt(kiln.quoteAsk(), kiln.ask());
+
+        // buy(id) executes at quoteAsk(), not ask().
+        uint256 quoted = kiln.quoteAsk();
+        uint256 before = zto.balanceOf(buyer);
+        vm.prank(buyer);
+        kiln.buy(id);
+        assertEq(before - zto.balanceOf(buyer), quoted, "buy charged the quote");
+    }
+
+    function test_buy_withMaxPrice() public {
+        seed(5000e18);
+        uint256 id = mintPiece(seller);
+        vm.prank(seller);
+        kiln.sell(id);
+        uint256 stale = kiln.ask();
+        address trader = makeTrader("t0", 0);
+        swapAs(trader, true, -1 ether);
+        uint256 live = kiln.quoteAsk();
+        assertGt(live, stale);
+
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(Kiln.PriceAboveMax.selector, live, stale));
+        kiln.buy(id, stale);
+        assertTrue(kiln.held(id), "piece stays");
+        assertGt(kiln.claims(), 0, "the revert undid the collect() as well");
+
+        uint256 before = zto.balanceOf(buyer);
+        vm.expectEmit(address(kiln));
+        emit Kiln.Bought(id, buyer, live);
+        vm.prank(buyer);
+        kiln.buy(id, live);
+        assertEq(before - zto.balanceOf(buyer), live);
+        assertEq(pepeo.ownerOf(id), buyer);
+    }
+
+    function test_sell_withMinPrice() public {
+        seed(5000e18);
+        uint256 a = mintPiece(seller);
+        uint256 b = mintPiece(seller);
+        uint256 quoted = kiln.quoteBid();
+        assertEq(quoted, 100e18);
+        // A competing sale lands first and lowers the bid.
+        vm.prank(seller);
+        kiln.sell(a);
+        assertEq(kiln.quoteBid(), 98e18);
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(Kiln.PriceBelowMin.selector, 98e18, quoted));
+        kiln.sell(b, quoted);
+        assertEq(pepeo.ownerOf(b), seller, "piece stays with the seller");
+        assertEq(kiln.reserve(), 4900e18, "nothing paid");
+
+        uint256 before = zto.balanceOf(seller);
+        vm.expectEmit(address(kiln));
+        emit Kiln.Sold(b, seller, 98e18);
+        vm.prank(seller);
+        kiln.sell(b, 98e18);
+        assertEq(zto.balanceOf(seller) - before, 98e18);
+        assertTrue(kiln.held(b));
+    }
+
+    function test_boundedOverloads_sameChecksAsPlainOnes() public {
+        uint256 id = mintPiece(seller);
+        vm.prank(seller);
+        vm.expectRevert(Kiln.EmptyReserve.selector);
+        kiln.sell(id, 0);
+        seed(5000e18);
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(Kiln.NotInInventory.selector, id));
+        kiln.buy(id, type(uint256).max);
+    }
+
     function test_inventory_removalKeepsOtherPieces() public {
         seed(50_000e18);
         uint256 a = mintPiece(seller);

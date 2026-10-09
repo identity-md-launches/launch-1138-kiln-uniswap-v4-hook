@@ -106,6 +106,12 @@ contract Kiln is IUnlockCallback {
     error NoSuchTier(uint256 index);
     error PieceNotReceived(uint256 id);
     error TransferFailed();
+    /// @notice A ZTO-specified swap (ZTO-in exact-input or ETH-in exact-output) stopped at its price limit or ran
+    ///         out of liquidity after the cut was taken on the full specified amount. `asked` is the ZTO the pool
+    ///         was told to move, `realised` what it moved.
+    error PartialFill(uint256 asked, uint256 realised);
+    error PriceBelowMin(uint256 price, uint256 minPrice);
+    error PriceAboveMax(uint256 price, uint256 maxPrice);
 
     // ------------------------------------------------------------------ constructor
 
@@ -138,6 +144,17 @@ contract Kiln is IUnlockCallback {
         return bid() * (BPS + SPREAD_BPS) / BPS;
     }
 
+    /// @notice The bid `sell()` would pay right now: `sell()` runs `collect()` first, so the pending ERC-6909 ZTO
+    ///         claims count. Equals `bid()` whenever there is nothing to collect.
+    function quoteBid() public view returns (uint256) {
+        return (reserve + POOL_MANAGER.balanceOf(address(this), _ztoId())) / DEPTH;
+    }
+
+    /// @notice The ask `buy()` would charge right now, pending claims included.
+    function quoteAsk() public view returns (uint256) {
+        return quoteBid() * (BPS + SPREAD_BPS) / BPS;
+    }
+
     /// @notice Ids currently held and purchasable.
     function inventory() external view returns (uint256[] memory) {
         return _inventory;
@@ -161,7 +178,7 @@ contract Kiln is IUnlockCallback {
 
     /// @notice The pass tier `wallet` would get right now, from its live PEPEO balance.
     function tierOf(address wallet) external view returns (uint256 index, uint256 pepes, uint24 kilnCut) {
-        pepes = PEPEO.balanceOf(wallet);
+        pepes = _pepesOf(wallet);
         (index, kilnCut) = _tierFor(pepes);
     }
 
@@ -176,13 +193,13 @@ contract Kiln is IUnlockCallback {
         _onlyKilnPool(key);
         if (!_ztoIsSpecified(params)) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
-        uint256 amount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 cut = _takeCut(amount);
+        uint256 cut = _takeCut(_abs(params.amountSpecified));
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(cut.toInt128(), 0), 0);
     }
 
     /// @notice Takes the Kiln cut when ZTO is the unspecified currency: ETH-in exact-input (from the ZTO output) and
-    ///         ZTO-in exact-output (from the ZTO input). Returns zero when `beforeSwap` already took it.
+    ///         ZTO-in exact-output (from the ZTO input), measured on the ZTO the pool actually moved. When
+    ///         `beforeSwap` already took the cut, checks the pool moved everything it was asked to and returns zero.
     function afterSwap(
         address,
         PoolKey calldata key,
@@ -191,11 +208,12 @@ contract Kiln is IUnlockCallback {
         bytes calldata
     ) external returns (bytes4, int128) {
         _onlyKilnPool(key);
-        if (_ztoIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
+        if (_ztoIsSpecified(params)) {
+            _requireFullFill(params, _abs(delta.amount1()));
+            return (IHooks.afterSwap.selector, 0);
+        }
 
-        int128 amount1 = delta.amount1();
-        uint256 amount = amount1 < 0 ? uint256(uint128(-amount1)) : uint256(uint128(amount1));
-        uint256 cut = _takeCut(amount);
+        uint256 cut = _takeCut(_abs(delta.amount1()));
         return (IHooks.afterSwap.selector, cut.toInt128());
     }
 
@@ -221,37 +239,26 @@ contract Kiln is IUnlockCallback {
         POOL_MANAGER.unlock(abi.encode(amount));
     }
 
-    /// @notice Sells piece `id` to the Kiln for `bid()`. The caller must have approved the Kiln on PEPEO first.
+    /// @notice Sells piece `id` to the Kiln for `bid()` after `collect()`, i.e. for `quoteBid()`. The caller must
+    ///         have approved the Kiln on PEPEO first.
     function sell(uint256 id) external {
-        collect();
-        uint256 price = bid();
-        if (price == 0) revert EmptyReserve();
-        if (_slot[id] != 0) revert AlreadyHeld(id);
-        reserve -= price;
-        _inventory.push(id);
-        _slot[id] = _inventory.length;
-        emit Sold(id, msg.sender, price);
-        PEPEO.transferFrom(msg.sender, address(this), id);
-        if (PEPEO.ownerOf(id) != address(this)) revert PieceNotReceived(id);
-        if (!ZTO.transfer(msg.sender, price)) revert TransferFailed();
+        _sell(id, 0);
     }
 
-    /// @notice Buys piece `id` from the Kiln for `ask()`. The caller must have approved the Kiln on ZTO first.
+    /// @notice `sell(id)` that reverts `PriceBelowMin` unless the price paid is at least `minPrice`.
+    function sell(uint256 id, uint256 minPrice) external {
+        _sell(id, minPrice);
+    }
+
+    /// @notice Buys piece `id` from the Kiln for `ask()` after `collect()`, i.e. for `quoteAsk()`. The caller must
+    ///         have approved the Kiln on ZTO first.
     function buy(uint256 id) external {
-        collect();
-        uint256 index = _slot[id];
-        if (index == 0) revert NotInInventory(id);
-        uint256 price = ask();
-        if (price == 0) revert EmptyReserve();
-        reserve += price;
-        uint256 last = _inventory[_inventory.length - 1];
-        _inventory[index - 1] = last;
-        _slot[last] = index;
-        _inventory.pop();
-        delete _slot[id];
-        emit Bought(id, msg.sender, price);
-        if (!ZTO.transferFrom(msg.sender, address(this), price)) revert TransferFailed();
-        PEPEO.transferFrom(address(this), msg.sender, id);
+        _buy(id, type(uint256).max);
+    }
+
+    /// @notice `buy(id)` that reverts `PriceAboveMax` unless the price charged is at most `maxPrice`.
+    function buy(uint256 id, uint256 maxPrice) external {
+        _buy(id, maxPrice);
     }
 
     /// @notice Adds `amount` ZTO from the caller to the reserve. The caller must have approved the Kiln on ZTO first.
@@ -263,6 +270,39 @@ contract Kiln is IUnlockCallback {
     }
 
     // ------------------------------------------------------------------ internals
+
+    function _sell(uint256 id, uint256 minPrice) internal {
+        collect();
+        uint256 price = bid();
+        if (price == 0) revert EmptyReserve();
+        if (price < minPrice) revert PriceBelowMin(price, minPrice);
+        if (_slot[id] != 0) revert AlreadyHeld(id);
+        reserve -= price;
+        _inventory.push(id);
+        _slot[id] = _inventory.length;
+        emit Sold(id, msg.sender, price);
+        PEPEO.transferFrom(msg.sender, address(this), id);
+        if (PEPEO.ownerOf(id) != address(this)) revert PieceNotReceived(id);
+        if (!ZTO.transfer(msg.sender, price)) revert TransferFailed();
+    }
+
+    function _buy(uint256 id, uint256 maxPrice) internal {
+        collect();
+        uint256 index = _slot[id];
+        if (index == 0) revert NotInInventory(id);
+        uint256 price = ask();
+        if (price == 0) revert EmptyReserve();
+        if (price > maxPrice) revert PriceAboveMax(price, maxPrice);
+        reserve += price;
+        uint256 last = _inventory[_inventory.length - 1];
+        _inventory[index - 1] = last;
+        _slot[last] = index;
+        _inventory.pop();
+        delete _slot[id];
+        emit Bought(id, msg.sender, price);
+        if (!ZTO.transferFrom(msg.sender, address(this), price)) revert TransferFailed();
+        PEPEO.transferFrom(address(this), msg.sender, id);
+    }
 
     function _poolKey(address zto) internal view returns (PoolKey memory) {
         return PoolKey({
@@ -297,16 +337,52 @@ contract Kiln is IUnlockCallback {
         return (0, CUT_0);
     }
 
+    /// @dev The trader's PEPEO balance. `tx.origin` is zero in a from-less `eth_call`, where Pepeolithic's
+    ///      OpenZeppelin `balanceOf` reverts, so that and any other failure of the read count as no pieces (tier 0)
+    ///      rather than making every swap simulation fail.
+    function _pepesOf(address wallet) internal view returns (uint256) {
+        if (wallet == address(0)) return 0;
+        try PEPEO.balanceOf(wallet) returns (uint256 pepes) {
+            return pepes;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @dev kilnCut of `ztoAmount` for a wallet with `pepes` pieces.
+    function _cutFor(uint256 ztoAmount, uint256 pepes) internal pure returns (uint256 cut, uint24 kilnCut) {
+        (, kilnCut) = _tierFor(pepes);
+        cut = ztoAmount * kilnCut / PIPS;
+    }
+
     /// @dev Reads the trader's pass, computes the cut on `ztoAmount`, mints it to the Kiln as ERC-6909 ZTO claims
     ///      and records it. Emits Passed exactly once per swap (each swap reaches this from one callback only).
     function _takeCut(uint256 ztoAmount) internal returns (uint256 cut) {
-        uint256 pepes = PEPEO.balanceOf(tx.origin);
-        (, uint24 kilnCut) = _tierFor(pepes);
-        cut = ztoAmount * kilnCut / PIPS;
+        uint256 pepes = _pepesOf(tx.origin);
+        uint24 kilnCut;
+        (cut, kilnCut) = _cutFor(ztoAmount, pepes);
         emit Passed(tx.origin, pepes, kilnCut, cut);
         if (cut != 0) {
             claims += cut;
             POOL_MANAGER.mint(address(this), _ztoId(), cut);
         }
+    }
+
+    /// @dev `beforeSwap` took the cut on the full specified ZTO amount before the pool ran, and the hook cannot
+    ///      change that delta afterwards. The pool stops early at its price limit or when liquidity runs out, so a
+    ///      partial fill would leave the trader paying the cut on ZTO that never traded (or, exact-output, paying
+    ///      ZTO on a swap meant to deliver it). Reverts unless the pool moved exactly what it was asked to:
+    ///      |amountSpecified| - cut for exact-input, amountSpecified + cut for exact-output. A wallet that pays no
+    ///      cut has nothing to reconcile and may fill partially like any other v4 swap.
+    function _requireFullFill(IPoolManager.SwapParams calldata params, uint256 realised) internal view {
+        uint256 specified = _abs(params.amountSpecified);
+        (uint256 cut,) = _cutFor(specified, _pepesOf(tx.origin));
+        if (cut == 0) return;
+        uint256 asked = params.amountSpecified < 0 ? specified - cut : specified + cut;
+        if (realised != asked) revert PartialFill(asked, realised);
+    }
+
+    function _abs(int256 x) internal pure returns (uint256) {
+        return x < 0 ? uint256(-x) : uint256(x);
     }
 }

@@ -64,6 +64,16 @@ The cut is not taken as real tokens inside the swap. The hook settles its return
 claim tokens to itself (`poolManager.mint(address(this), zto, cut)`) and adds the amount to `claims`. Tier 5
 (21+ pieces) pays no cut at all. Each swap emits `Passed(trader, pepes, kilnCut, ztoTaken)`.
 
+**Partial fills.** A v4 swap stops early, without reverting, when it reaches its `sqrtPriceLimitX96` or the pool
+runs out of liquidity. In cases 2 and 3 the cut is measured in `afterSwap` on the ZTO the pool actually moved, so a
+partial fill is simply charged on the realised amount. In cases 1 and 4 the cut is taken in `beforeSwap` on the
+full specified amount and the hook cannot change that delta afterwards, so `afterSwap` checks that the pool moved
+exactly what it was asked to (`|amountSpecified| − cut` for exact input, `amountSpecified + cut` for exact output)
+and reverts with `PartialFill(asked, realised)` otherwise. The trader is never charged on ZTO that did not trade.
+Routers surface this as a failed swap; re-quote with a smaller size or a wider limit. A wallet that pays no cut
+(tier 5) has nothing to reconcile and its ZTO-specified swaps may fill partially like any other v4 swap. On an
+empty pool a ZTO exact-input swap therefore reverts instead of paying a cut for nothing.
+
 The hook has no liquidity callbacks and serves exactly one pool: callbacks revert with `NotKilnPool` for any
 other pool key that names the Kiln as its hook. Any range position can be added or removed freely.
 
@@ -78,13 +88,18 @@ other pool key that names the Kiln as its hook. Any range position can be added 
 - `bid()` = `reserve / DEPTH`. Real ZTO only, so it is always payable. It falls geometrically as pieces come in
   and rises with every cut, seed and sale.
 - `ask()` = `bid() * (10000 + SPREAD_BPS) / 10000`.
+- `quoteBid()` / `quoteAsk()` are the same formulas with the pending claims added to the reserve. Because
+  `sell()` and `buy()` run `collect()` first, these are the prices they actually execute at; `bid()`/`ask()`
+  only equal them when `claims()` is zero. Quote with `quoteBid()`/`quoteAsk()`, or pass a bound.
 - `inventory()` lists the ids held; `held(id)` checks one.
 
-| Function      | Effect                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------- |
-| `sell(id)`    | Price = `bid()` before the transfer. Pulls the piece with `transferFrom` (approve the Kiln on PEPEO first), `reserve -= price`, pays ZTO, emits `Sold`. Reverts `EmptyReserve` if `bid()` is 0. |
-| `buy(id)`     | `id` must be in inventory. Price = `ask()`. Pulls ZTO with `transferFrom` (approve the Kiln on ZTO first), `reserve += price`, sends the piece with `transferFrom` (never `safeTransferFrom`), emits `Bought`. |
-| `seed(amount)`| Anyone adds ZTO to the reserve with `transferFrom`, emits `Seeded`.                                     |
+| Function              | Effect                                                                                          |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `sell(id)`            | Runs `collect()`. Price = `bid()` before the transfer. Pulls the piece with `transferFrom` (approve the Kiln on PEPEO first), `reserve -= price`, pays ZTO, emits `Sold`. Reverts `EmptyReserve` if `bid()` is 0. |
+| `sell(id, minPrice)`  | Same, but reverts `PriceBelowMin(price, minPrice)` if the price is below `minPrice`.             |
+| `buy(id)`             | Runs `collect()`. `id` must be in inventory. Price = `ask()`. Pulls ZTO with `transferFrom` (approve the Kiln on ZTO first), `reserve += price`, sends the piece with `transferFrom` (never `safeTransferFrom`), emits `Bought`. |
+| `buy(id, maxPrice)`   | Same, but reverts `PriceAboveMax(price, maxPrice)` if the price is above `maxPrice`.             |
+| `seed(amount)`        | Anyone adds ZTO to the reserve with `transferFrom`, emits `Seeded`.                              |
 
 No other function moves ZTO or pieces. There is no `receive`, so the Kiln never holds ETH.
 
@@ -93,6 +108,24 @@ No other function moves ZTO or pieces. There is no `receive`, so the Kiln never 
 - **The pass is read from `tx.origin`.** Routers are `msg.sender`; the trader is `tx.origin`. A pass only
   needs to be in the wallet during the swap; there is no block-held guard. Smart-contract wallets whose
   `tx.origin` is a relayer get the relayer's tier, and a piece can be borrowed for the duration of a trade.
+  A from-less `eth_call` (quoters, simulators) runs with `tx.origin == address(0)`, where Pepeolithic's
+  OpenZeppelin `balanceOf` reverts; the Kiln treats a zero origin, and any failing `balanceOf` read, as zero
+  pieces (tier 0) so simulations and swaps keep working. A trader whose pass cannot be read pays the full cut.
+- **Quote versus execution.** `bid()` and `ask()` read the real reserve only; `sell()` and `buy()` collect the
+  pending claims first and execute at `quoteBid()`/`quoteAsk()`, which are at least as high. A buyer who
+  approves exactly `ask()` sees `buy()` revert on allowance once any cut is pending; a buyer with an open
+  allowance pays the higher amount. Use the quote views, or `buy(id, maxPrice)` / `sell(id, minPrice)` to refuse
+  a price that moved between quote and execution. The deviation always favours the reserve.
+- **`collect()` inside another PoolManager unlock.** `collect()` opens its own `unlock`, which the PoolManager
+  rejects while one is already open. A contract that calls `collect()`, `sell()` or `buy()` from inside its
+  own `unlockCallback` succeeds only while `claims()` is zero and reverts `AlreadyUnlocked` otherwise. Trade
+  pieces in a separate transaction, or outside the unlock.
+- **Pepeolithic's own admin.** The Pepeolithic contract has `admin` and `adam` roles and a `sweep()` that mints
+  the unsold pieces of a closed cave to the admin for free. The Kiln buys from anyone at `bid()` with no
+  per-seller limit, so an actor holding k zero-cost pieces can convert them into `1 − (49/50)^k` of the reserve
+  (50 pieces: about 64%, 100 pieces: about 87%), each sale lowering the next bid by 2%. This is the design the
+  brief asks for; the Kiln has no role that could refuse a seller. Holders of ZTO cuts should understand that
+  the reserve is open to every Pepeolithic holder, including the collection's admin.
 - **Pieces sent by plain transfer are stuck.** Only `sell()` adds a piece to inventory. A PEPEO piece that
   arrives through `transferFrom` or `safeTransferFrom` outside `sell()` is not inventory, cannot be bought and
   cannot be recovered. Likewise ZTO sent directly to the Kiln is not reserve and cannot be recovered; use
@@ -100,8 +133,8 @@ No other function moves ZTO or pieces. There is no `receive`, so the Kiln never 
 - **ERC-6909 ZTO claims transferred to the Kiln** are swept into the reserve by the next `collect()`.
 - **Dust.** With a reserve under 50 wei `bid()` is 0 and `sell()` reverts; `buy()` likewise reverts when
   `ask()` is 0, so a held piece waits for a `seed()` rather than leaving for free.
-- **Exact-output ETH-in swaps that hit the price limit** still pay the cut on the specified amount, so the
-  trader may receive less than the specified output. Routers enforce their minimum-output checks as usual.
+- **Partial fills of ZTO-specified swaps revert.** See "Partial fills" above: a ZTO-in exact-input or ETH-in
+  exact-output swap that cannot be filled in full reverts `PartialFill` whenever a cut applies.
 - **Protocol fee.** Uniswap governance may enable a protocol fee on any v4 pool. It comes out of the LP fee
   side and does not touch the Kiln cut.
 - **Fee-on-transfer or rebasing tokens** are out of scope: ZTO is a plain ERC-20 and the Kiln relies on it.
@@ -120,11 +153,25 @@ No other function moves ZTO or pieces. There is no `receive`, so the Kiln never 
    the wrong bits and `AlreadyOpened` after the first success. `sqrtPriceX96 = sqrt(ZTO per ETH) * 2^96`
    because both currencies have 18 decimals; for example 1,000,000 ZTO per ETH is
    `79228162514264337593543950336000`. The call emits `Opened(kiln, poolId)` and adds no liquidity.
-4. Add the ZTO-only range position through the normal Uniswap v4 PositionManager
+   **Send it through a private relay** (Flashbots Protect or similar), not the public mempool: `open()` is
+   permissionless and its arguments are public, so a watcher could call it first with another price. The pool
+   key is also predictable from the salt, and the PoolManager lets anyone initialize it before the Kiln exists
+   (the Kiln has no initialize hook bits, so no hook call stops them). `open()` cannot be blocked that way: it
+   reads the pool's slot0 and, if the pool is already initialized, adopts it at its live price, emits
+   `Preinitialized(poolId, livePrice, requestedPrice)` and then `Opened`. The requested price is ignored in that
+   case.
+4. **Check the live price before adding liquidity**: read slot0 for the pool id (`StateLibrary.getSlot0`, or
+   `cast call <poolManager> "extsload(bytes32)"` on the pool state slot) and confirm it is the intended
+   `sqrtPriceX96`. If a `Preinitialized` event fired, or someone front-ran `open()` with a different price, move
+   the empty pool to the intended tick with a dust swap whose `sqrtPriceLimitX96` is the intended price (ZTO in,
+   `zeroForOne = false`, raises the price; ETH in lowers it); with no liquidity the swap moves the price and costs
+   only dust. Use a tier-5 wallet or accept the dust cut. A range placed on the wrong side of the live tick would
+   demand ETH instead of ZTO.
+5. Add the ZTO-only range position through the normal Uniswap v4 PositionManager
    (`0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e` on mainnet). In Uniswap terms the pool price is ZTO per ETH,
    so a range in which ZTO is priced above the opening price is a range of ticks entirely at or below the
    current tick (`tickUpper <= currentTick`), both ticks multiples of 60. Such a position takes only ZTO.
-5. Optionally `seed()` the reserve so `bid()` is non-zero from day one.
+6. Optionally `seed()` the reserve so `bid()` is non-zero from day one.
 
 ### Operational responsibilities
 
@@ -147,24 +194,28 @@ forge fmt --check
 
 `foundry.toml` pins `solc = "0.8.26"`, `via_ir = true`, `optimizer_runs = 1`, `evm_version = "cancun"`,
 `bytecode_hash = "none"` and `cbor_metadata = false`. Custom errors only, no ReentrancyGuard: state is
-updated before external token calls, which come last. Kiln runtime is about 5.8 KB (limit 12,000 bytes),
-Launcher about 8 KB including the embedded Kiln init code.
+updated before external token calls, which come last. Kiln runtime is 6,366 bytes (limit 12,000), Launcher
+8,745 bytes including the embedded Kiln init code.
 
 Tests run against the real v4 `PoolManager` with the v4-core test routers (`PoolSwapTest`,
 `PoolModifyLiquidityTest`), a mock 18-decimal ZTO and a mock ERC-721:
 
 - `test/Launcher.t.sol`: open() once and only at an address with the right bits, pool initialized with
-  lpFee 2000 / tickSpacing 60 / Kiln as hook, rollback when initialization fails, `initCodeHash()` and
+  lpFee 2000 / tickSpacing 60 / Kiln as hook, rollback when initialization fails, open() adopting a pool
+  somebody initialized first (and the dust-swap recovery of its price), `initCodeHash()` and
   `kilnAddress()`, the Kiln constructor not validating its address, runtime size and opcode scan.
 - `test/KilnSwap.t.sol`: a ZTO-only range position above the opening price; all four swap cases for wallets
   holding 0, 1, 3, 7, 12 and 21 pieces, checking the cut equals kilnCut of the ZTO side within rounding,
   tier 21 pays nothing, the cut shows in `claims()` and after `collect()` in `reserve()` and the real ZTO
-  balance, `collect()` with nothing is a no-op, the trader also paid the LP fee, callbacks reject other
-  callers and other pools, liquidity is unrestricted.
+  balance, `collect()` with nothing is a no-op, the trader also paid the LP fee; partial fills: ZTO-specified
+  swaps revert `PartialFill` at a price limit, on exhausted liquidity and on an empty pool while tier 5 may
+  fill partially, and the afterSwap cases charge the realised amount; a zero `tx.origin` and a reverting
+  PEPEO read fall back to tier 0; callbacks reject other callers and other pools; liquidity is unrestricted.
 - `test/KilnPieces.t.sol`: sell pays bid and bid falls geometrically; buy charges ask and the piece leaves
-  inventory; buy of an id not held reverts; sell at zero reserve reverts; seed grows bid; failed token
-  transfers revert; stuck transfers; a fuzzed action sequence keeps `reserve <= balance`; nobody can
-  withdraw.
+  inventory; buy of an id not held reverts; sell at zero reserve reverts; seed grows bid; `quoteBid()` and
+  `quoteAsk()` include pending claims and are what `buy()`/`sell()` execute at; the bounded overloads revert
+  `PriceAboveMax`/`PriceBelowMin`; failed token transfers revert; stuck transfers; a fuzzed action sequence
+  keeps `reserve <= balance`; nobody can withdraw.
 
 Slither is not available in this environment and was not run. The code follows its two relevant rules by
 construction: every division comes after the multiplication it scales, and the only `abi.encodePacked` has

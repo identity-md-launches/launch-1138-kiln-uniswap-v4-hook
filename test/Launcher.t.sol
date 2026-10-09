@@ -2,8 +2,10 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {PoolManager} from "v4-core/src/PoolManager.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -140,6 +142,74 @@ contract LauncherTest is Test {
         assertEq(address(launcher.kiln()), address(0), "deployment rolled back");
         launcher.open(salt, openPrice);
         assertEq(address(launcher.kiln()), predicted);
+    }
+
+    /// The pool key is predictable from the salt, and PoolManager.initialize makes no hook call for an address
+    /// without initialize bits, so anyone can initialize it before the Kiln exists. open() must not be blockable
+    /// that way: it adopts the live price, reports it, and still deploys and records the Kiln.
+    function test_open_adoptsPreinitializedPool() public {
+        (address predicted, bytes32 salt) = goodSalt();
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(zto)),
+            fee: 2000,
+            tickSpacing: 60,
+            hooks: IHooks(predicted)
+        });
+        PoolId id = key.toId();
+        uint160 griefPrice = TickMath.getSqrtPriceAtTick(0);
+        vm.prank(makeAddr("griefer"));
+        manager.initialize(key, griefPrice);
+        assertEq(predicted.code.length, 0, "Kiln does not exist yet");
+
+        vm.expectEmit(address(launcher));
+        emit Launcher.Preinitialized(id, griefPrice, openPrice);
+        vm.expectEmit(address(launcher));
+        emit Launcher.Opened(predicted, id);
+        (address kilnAddr, PoolId returned) = launcher.open(salt, openPrice);
+
+        assertEq(kilnAddr, predicted);
+        assertEq(PoolId.unwrap(returned), PoolId.unwrap(id));
+        assertEq(address(launcher.kiln()), predicted);
+        (uint160 sqrtPriceX96, int24 tick,, uint24 lpFee) = manager.getSlot0(id);
+        assertEq(sqrtPriceX96, griefPrice, "live price kept, requested price ignored");
+        assertEq(tick, 0);
+        assertEq(lpFee, 2000);
+        vm.expectRevert(Launcher.AlreadyOpened.selector);
+        launcher.open(salt, openPrice);
+
+        // The adopted pool is fully usable: a dust ZTO-in swap with the intended price as its limit moves the
+        // empty pool to the intended tick, after which liquidity can be added on the right side.
+        PoolSwapTest swapRouter = new PoolSwapTest(manager);
+        address fixer = makeAddr("fixer");
+        zto.mint(fixer, 1e18);
+        vm.startPrank(fixer, fixer);
+        zto.approve(address(swapRouter), type(uint256).max);
+        for (uint256 i = 1; i <= 21; ++i) {
+            pepeo.mint(fixer, i);
+        }
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({zeroForOne: false, amountSpecified: -1000, sqrtPriceLimitX96: openPrice}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        vm.stopPrank();
+        (sqrtPriceX96, tick,,) = manager.getSlot0(id);
+        assertEq(sqrtPriceX96, openPrice, "price moved to the intended opening price");
+        assertEq(tick, 138_180);
+    }
+
+    /// Without a pre-initialization open() initializes the pool itself and reports no adoption.
+    function test_open_doesNotEmitPreinitializedNormally() public {
+        (, bytes32 salt) = goodSalt();
+        vm.recordLogs();
+        launcher.open(salt, openPrice);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("Preinitialized(bytes32,uint160,uint160)");
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != sig, "no Preinitialized");
+        }
     }
 
     function test_open_onlyOnce() public {
