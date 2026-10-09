@@ -3,9 +3,12 @@ pragma solidity 0.8.26;
 
 import {Vm} from "forge-std/Vm.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 
 import {Kiln} from "../src/Kiln.sol";
@@ -112,6 +115,225 @@ contract KilnPropertiesTest is KilnBase {
         assertEq(kiln.claims() - before, 0);
         swapAs(trader, false, -77);
         assertEq(kiln.claims() - before, 1);
+    }
+
+    // ------------------------------------------------------------------ partial fills
+
+    /// @dev Swap with an explicit price limit, msg.sender and tx.origin both `trader`.
+    function _swapLimited(address trader, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        internal
+        returns (BalanceDelta delta)
+    {
+        uint256 value;
+        if (zeroForOne) value = amountSpecified < 0 ? uint256(-amountSpecified) : 5000 ether;
+        if (value > trader.balance) vm.deal(trader, value);
+        vm.prank(trader, trader);
+        delta = swapRouter.swap{value: value}(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    /// @dev The PoolManager's wrapping of an afterSwap revert with PartialFill(asked, realised).
+    function _wrappedPartialFill(uint256 asked, uint256 realised) internal view returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(kiln),
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(Kiln.PartialFill.selector, asked, realised),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
+    }
+
+    /// @dev Current sqrtPriceX96 lowered by `bps`; the range extends 6000 ticks down, so up to 20% stays inside.
+    function _limitBelow(uint256 bps) internal view returns (uint160) {
+        (uint160 sqrtP,,,) = manager.getSlot0(poolId);
+        return uint160(uint256(sqrtP) * (10_000 - bps) / 10_000);
+    }
+
+    /// @notice For any paying tier and any binding price limit, a ZTO-specified swap that cannot fill in full
+    ///         reverts PartialFill(asked, realised) with asked = specified minus the cut (exact input) or plus it
+    ///         (exact output) and realised the ZTO the pool actually moved, and leaves nothing behind. The same
+    ///         swap by a 21-piece wallet goes through as a partial fill and pays nothing.
+    /// forge-config: default.fuzz.runs = 200
+    function testFuzz_partialFill_ztoSpecified_revertsForPayingTiers(uint8 tierSeed, uint16 bpsSeed, bool exactOut)
+        public
+    {
+        uint256 t = bound(tierSeed, 0, 4);
+        uint256 bps = bound(bpsSeed, 1, 2000);
+        address trader = makeTrader("pf", tierPieces[t]);
+        uint24 cutPips = tierCuts[t];
+
+        bool zeroForOne = exactOut; // ETH in for exact ZTO out; ZTO in for exact ZTO in
+        int256 amountSpecified;
+        uint160 limit;
+        if (exactOut) {
+            // Ask for twice the ZTO the pool holds, stopping at a limit inside the range.
+            amountSpecified = int256(zto.balanceOf(address(manager)) * 2);
+            limit = _limitBelow(bps);
+        } else {
+            // Push in far more ZTO than the range's ETH can absorb; the pool stops when liquidity runs out.
+            (uint160 sqrtP,,,) = manager.getSlot0(poolId);
+            uint256 ztoPerEthX96 = (uint256(sqrtP) * uint256(sqrtP)) >> 96;
+            amountSpecified = -int256((address(manager).balance * ztoPerEthX96 >> 96) * 4);
+            limit = TickMath.MAX_SQRT_PRICE - 1;
+        }
+        uint256 specified = abs(int128(amountSpecified));
+        uint256 cut = specified * cutPips / PIPS;
+        uint256 asked = exactOut ? specified + cut : specified - cut;
+
+        // Probe what the pool can move with a wallet that pays no cut; the paying wallet asks the pool for `asked`,
+        // which is also beyond what it can move, so it stops at the same place.
+        uint256 snap = vm.snapshotState();
+        BalanceDelta probe = _swapLimited(whale, zeroForOne, amountSpecified, limit);
+        uint256 realised = abs(probe.amount1());
+        assertLt(realised, asked, "fixture: the probe must be a partial fill even after the cut");
+        assertEq(kiln.claims(), 0, "tier 21 pays nothing on a partial fill");
+        vm.revertToState(snap);
+
+        vm.deal(trader, 6000 ether); // enough for the exact-output router call; fixed before the snapshot below
+        uint256 ethBefore = trader.balance;
+        uint256 ztoBefore = zto.balanceOf(trader);
+        vm.expectRevert(_wrappedPartialFill(asked, realised));
+        _swapLimited(trader, zeroForOne, amountSpecified, limit);
+        assertEq(kiln.claims(), 0, "claims after a reverted swap");
+        assertEq(manager.balanceOf(address(kiln), ztoId), 0, "6909 after a reverted swap");
+        assertEq(trader.balance, ethBefore, "ETH after a reverted swap");
+        assertEq(zto.balanceOf(trader), ztoBefore, "ZTO after a reverted swap");
+    }
+
+    /// @notice The afterSwap shapes (ETH in exact input, ZTO in exact output) may fill partially; the cut is then
+    ///         exactly floor(kilnCut * ZTO the pool moved) for every tier, and Passed reports it.
+    /// forge-config: default.fuzz.runs = 200
+    function testFuzz_partialFill_afterSwapShapes_chargeRealised(uint8 tierSeed, uint16 bpsSeed, bool exactOut) public {
+        uint256 t = bound(tierSeed, 0, 5);
+        uint256 bps = bound(bpsSeed, 1, 2000);
+        address trader = makeTrader("pa", tierPieces[t]);
+
+        bool zeroForOne = !exactOut; // ETH in exact input, or ZTO in exact ETH output
+        int256 amountSpecified;
+        uint160 limit;
+        if (zeroForOne) {
+            (uint160 sqrtP,,,) = manager.getSlot0(poolId);
+            uint256 ztoPerEthX96 = (uint256(sqrtP) * uint256(sqrtP)) >> 96;
+            amountSpecified = -int256((zto.balanceOf(address(manager)) << 96) / ztoPerEthX96 * 2);
+            limit = _limitBelow(bps);
+        } else {
+            amountSpecified = int256(address(manager).balance * 2);
+            limit = TickMath.MAX_SQRT_PRICE - 1;
+        }
+
+        vm.recordLogs();
+        BalanceDelta delta = _swapLimited(trader, zeroForOne, amountSpecified, limit);
+        (address pTrader, uint256 pPepes, uint24 pCut, uint256 pTaken) = findPassed(vm.getRecordedLogs());
+        uint256 taken = kiln.claims();
+        assertEq(pTrader, trader);
+        assertEq(pPepes, tierPieces[t]);
+        assertEq(pCut, tierCuts[t]);
+        assertEq(pTaken, taken);
+
+        uint256 realisedSpecified = abs(delta.amount0());
+        assertLt(realisedSpecified, abs(int128(amountSpecified)), "fixture: the swap must be a partial fill");
+        assertGt(realisedSpecified, 0, "fixture: something must have moved");
+        uint256 poolZto = zeroForOne ? abs(delta.amount1()) + taken : abs(delta.amount1()) - taken;
+        assertEq(taken, poolZto * tierCuts[t] / PIPS, "cut is floor(kilnCut * realised ZTO)");
+        if (tierCuts[t] == 0) assertEq(taken, 0);
+        assertEq(manager.balanceOf(address(kiln), ztoId), taken, "cut sits in claims");
+    }
+
+    // ------------------------------------------------------------------ bounded overloads
+
+    /// @notice sell(id, min) and buy(id, max) refuse exactly when the execution price crosses the bound, report
+    ///         that price, move nothing when they refuse, and otherwise behave like sell(id)/buy(id). The
+    ///         execution price is quoteBid()/quoteAsk(): the pending cut counts because sell()/buy() collect first.
+    /// forge-config: default.fuzz.runs = 300
+    function testFuzz_boundedOverloads(uint256 amountSeed, uint256 minSeed, uint256 maxSeed) public {
+        uint256 amount = bound(amountSeed, 1000, 1e27);
+        address actor = makeTrader("bo", 0);
+        zto.mint(actor, amount);
+        vm.prank(actor);
+        kiln.seed(amount);
+        // Leave a cut pending so quote and bid differ.
+        swapAs(actor, true, -1 ether);
+        uint256 pending = manager.balanceOf(address(kiln), ztoId);
+        assertGt(pending, 0);
+        uint256 price = (amount + pending) / 50;
+        assertEq(kiln.quoteBid(), price);
+        assertGt(kiln.quoteBid(), kiln.bid(), "quote above bid while a cut is pending");
+        uint256 id = mintPiece(actor);
+
+        uint256 minPrice = bound(minSeed, 0, price * 2);
+        if (minPrice > price) {
+            vm.prank(actor);
+            vm.expectRevert(abi.encodeWithSelector(Kiln.PriceBelowMin.selector, price, minPrice));
+            kiln.sell(id, minPrice);
+            assertEq(pepeo.ownerOf(id), actor, "piece moved on a refused sell");
+            assertEq(kiln.claims(), pending, "refused sell collected");
+            assertEq(kiln.reserve(), amount, "refused sell touched the reserve");
+            minPrice = price; // the bound met exactly is accepted
+        }
+        uint256 ztoBefore = zto.balanceOf(actor);
+        vm.prank(actor);
+        kiln.sell(id, minPrice);
+        assertEq(zto.balanceOf(actor) - ztoBefore, price, "sell paid the quoted bid");
+        assertEq(kiln.reserve(), amount + pending - price);
+        assertEq(kiln.claims(), 0);
+
+        uint256 ask = kiln.ask();
+        assertEq(ask, kiln.quoteAsk(), "nothing pending: ask is the quote");
+        uint256 maxPrice = bound(maxSeed, 0, ask * 2);
+        if (maxPrice < ask) {
+            vm.prank(actor);
+            vm.expectRevert(abi.encodeWithSelector(Kiln.PriceAboveMax.selector, ask, maxPrice));
+            kiln.buy(id, maxPrice);
+            assertTrue(kiln.held(id), "piece left on a refused buy");
+            assertEq(zto.balanceOf(actor), ztoBefore + price, "refused buy charged");
+            maxPrice = ask;
+        }
+        vm.prank(actor);
+        kiln.buy(id, maxPrice);
+        assertEq(ztoBefore + price - ask, zto.balanceOf(actor), "buy charged the ask");
+        assertEq(pepeo.ownerOf(id), actor);
+        assertFalse(kiln.held(id));
+    }
+
+    // ------------------------------------------------------------------ pass read failure
+
+    /// @notice When PEPEO.balanceOf reverts, every wallet is tier 0 and pays the full 1.30%; once it reads again
+    ///         the wallet is back on its tier. A zero origin is tier 0 without touching PEPEO.
+    /// forge-config: default.fuzz.runs = 64
+    function testFuzz_pepeoReadFailure_everyTierPaysFull(uint8 tierSeed) public {
+        uint256 t = bound(tierSeed, 0, 5);
+        address trader = makeTrader("rf", tierPieces[t]);
+        (uint256 index, uint256 pepes, uint24 cut) = kiln.tierOf(trader);
+        assertEq(index, t);
+        assertEq(pepes, tierPieces[t]);
+        assertEq(cut, tierCuts[t]);
+
+        pepeo.setBalanceOfReverts(true);
+        (index, pepes, cut) = kiln.tierOf(trader);
+        assertEq(index, 0, "unreadable pass is tier 0");
+        assertEq(pepes, 0);
+        assertEq(cut, 13_000);
+        (index, pepes, cut) = kiln.tierOf(address(0));
+        assertEq(cut, 13_000, "zero origin is tier 0");
+
+        vm.recordLogs();
+        BalanceDelta delta = swapAs(trader, true, -1 ether);
+        (, uint256 pPepes, uint24 pCut, uint256 taken) = findPassed(vm.getRecordedLogs());
+        assertEq(pPepes, 0);
+        assertEq(pCut, 13_000);
+        assertEq(taken, (abs(delta.amount1()) + taken) * 13_000 / PIPS, "full cut charged");
+        assertGt(taken, 0);
+
+        pepeo.setBalanceOfReverts(false);
+        (index, pepes, cut) = kiln.tierOf(trader);
+        assertEq(index, t, "tier restored once the read works");
+        assertEq(cut, tierCuts[t]);
     }
 
     /// @notice The pass is read from tx.origin, not msg.sender: a holder trading through a non-holding router
